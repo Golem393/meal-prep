@@ -279,16 +279,44 @@ function session(date){
   return {date,type,week:weekIdx(sun)+1,bowls,potKey:type==='sun'?w.sunPot:w.wedPot,
     potNights:[date,add(date,2)],tray:type==='sun'?w.sunTray:w.wedTray,extras};
 }
+/* Carry-over model: every prep cooks the normal amount (3 bowls, 3 pot portions).
+   A meal marked "eating out" leaves its box/portion over; it goes to the freezer and
+   fills the first slots of the next prep, which then cooks that much less. */
+const firstSession=(d,strict)=>{let s=START;while(strict?s<=d:s<d)s=nextSession(s);return s};
+let SIM={res:{},byKey:{}};
+function buildSim(horizon){
+  const res={},byKey={},pendL=[],pendD=[];
+  const take=(q,id)=>{const out=[];for(let i=0;i<q.length;)if(q[i].target===id)out.push(q.splice(i,1)[0]);else i++;return out};
+  for(let sd=START;sd<=horizon;sd=nextSession(sd)){
+    const s=session(sd),id=iso(sd),nx=iso(nextSession(sd));
+    const inL=take(pendL,id),inD=take(pendD,id);
+    inL.slice(3).forEach(x=>pendL.push({...x,target:nx}));
+    inD.slice(3).forEach(x=>pendD.push({...x,target:nx}));
+    const lunch=s.bowls.map((b,i)=>{const lo=inL[i];
+      return lo?{...lo.bowl,day:b.day,key:b.key,leftover:{from:lo.from,tray:lo.tray}}:{...b,leftover:null,tray:s.tray}});
+    const nD=Math.min(inD.length,3);
+    const dinner=[sd,add(sd,2),add(sd,s.type==='sun'?4:5)].map((d,i)=>{const lo=inD[i-(3-nD)];
+      return {date:d,key:iso(d)+'|dinner',potKey:lo?lo.potKey:s.potKey,leftover:lo?{from:lo.from}:null,frozen:i===2}});
+    const r={s,lunch,dinner,inL:inL.slice(0,3),inD:inD.slice(0,nD)};
+    res[id]=r;
+    lunch.forEach(sl=>{byKey[sl.key]={slot:sl,r};
+      if(isSkip(sl.key)){const {leftover,day,key,tray,...bowl}=sl;
+        pendL.push({bowl,tray,from:leftover?leftover.from:day,target:iso(firstSession(day,false))})}});
+    dinner.forEach(sl=>{byKey[sl.key]={slot:sl,r};
+      if(isSkip(sl.key))pendD.push({potKey:sl.potKey,from:sl.leftover?sl.leftover.from:sl.date,target:iso(firstSession(sl.date,true))})});
+  }
+  SIM={res,byKey};
+}
 function calc(s){
-  const eaten=s.bowls.filter(b=>!isSkip(b.key));
+  const r=SIM.res[iso(s.date)];
+  const eaten=r.lunch.filter(b=>!b.leftover);
   const allCooked=s.bowls.filter(b=>!b.noCook).length;
   const cooked=eaten.filter(b=>!b.noCook).length;
   const trayF=allCooked?cooked/allCooked:0;
-  const potEaten=s.potNights.filter(d=>!isSkip(iso(d)+'|dinner')).length;
-  const portions=potEaten?potEaten+1:0;
-  const extras=s.extras.filter(x=>!isSkip(x.key));
+  const potSlots=r.dinner.filter(d=>!d.leftover);
+  const portions=potSlots.length;
   const tray=s.tray.map(([n,g])=>[n,Math.round(g*trayF/10)*10]).filter(t=>t[1]>0);
-  return {eaten,cooked,tray,portions,potEaten,extras,pot:POT[s.potKey]};
+  return {eaten,cooked,tray,portions,potSlots,extras:s.extras,pot:POT[s.potKey],inL:r.inL,inD:r.inD};
 }
 function bowlNums(b){
   const ba=BASE[b.b],pr=PROT[b.p],sa=SAUCE[b.s];
@@ -300,21 +328,16 @@ function mealsFor(d){
   d=sod(d);const dw=d.getDay();const out={lunch:{kind:'none'},dinner:{kind:'none'}};
   if(d<START)return out;
   if(dw===0)out.lunch={kind:'free'};
-  else{
-    const sd=dw<=3?add(d,-dw):add(d,-(dw-3));
-    const s=session(sd);
-    if(s){const b=s.bowls.find(x=>iso(x.day)===iso(d));if(b)out.lunch={kind:'bowl',bowl:b,s}}
-  }
+  else{const e=SIM.byKey[iso(d)+'|lunch'];if(e)out.lunch={kind:'bowl',bowl:e.slot,s:e.r.s}}
   const key=iso(d)+'|dinner';
   if(iso(d)==='2026-11-26'){out.dinner={kind:'quick',q:QUICK.friedrice,key};return out}
   if(dw===6){out.dinner={kind:'pasta',key};return out}
-  if(dw===1||dw===4){
-    const s=session(add(d,dw===1?-5:-4));
-    out.dinner=s?{kind:'freezer',pot:POT[s.potKey],key}:{kind:'freezer',pot:null,key};return out;
-  }
-  const sd=(dw===0||dw===3)?d:add(d,-2);
-  const s=session(sd);
-  if(s)out.dinner={kind:'pot',pot:POT[s.potKey],fresh:iso(sd)===iso(d),key};
+  const e=SIM.byKey[key];
+  if(!e){if(dw===1||dw===4)out.dinner={kind:'freezer',pot:null,key};return out}
+  const sl=e.slot,pot=POT[sl.potKey];
+  if(sl.leftover)out.dinner={kind:'leftover',pot,from:sl.leftover.from,key};
+  else if(sl.frozen)out.dinner={kind:'freezer',pot,key};
+  else out.dinner={kind:'pot',pot,fresh:iso(e.r.s.date)===iso(d),key};
   return out;
 }
 function trayNames(s){return s.tray.map(t=>t[0].toLowerCase()).join(', ')}
@@ -370,8 +393,14 @@ shopS=firstShopSession();prepS=firstPrepSession();
 
 function bowlCard(b,s,key){
   const ba=BASE[b.b],pr=PROT[b.p],sa=SAUCE[b.s],n=bowlNums(b),sk=isSkip(key);
+  if(b.leftover)return `<div class="meal${sk?' skipped':''}">
+    <div class="meal-h"><span class="meal-t">Lunch · leftover</span><span class="kc">~${n.kcal} kcal · ${n.p} g protein</span></div>
+    <div class="meal-name">${b.style}</div>
+    <ul class="comp"><li><span class="q">1</span><span>box packed for ${fmt(b.leftover.from)}, from the freezer. Thaw in the fridge overnight, microwave until hot.</span></li></ul>
+    <div class="add">Add on the day: <b>${b.f.map(f=>FRESH[f].label).join(', ')}</b></div>
+    ${toggle(key,sk)}</div>`;
   const rows=[[ba.q,ba.label]];
-  if(!b.noCook)rows.push(['300 g','roasted veg ('+s.tray.map(t=>t[0].toLowerCase()).join(', ')+')']);
+  if(!b.noCook)rows.push(['300 g','roasted veg ('+(b.tray||s.tray).map(t=>t[0].toLowerCase()).join(', ')+')']);
   rows.push([pr.q,pr.label],['2 tbsp',sa.name+' sauce']);
   return `<div class="meal${sk?' skipped':''}">
     <div class="meal-h"><span class="meal-t">Lunch</span><span class="kc">~${n.kcal} kcal · ${n.p} g protein</span></div>
@@ -380,15 +409,20 @@ function bowlCard(b,s,key){
     <div class="add">Add on the day: <b>${b.f.map(f=>FRESH[f].label).join(', ')}</b></div>
     ${toggle(key,sk)}</div>`;
 }
-const toggle=(key,sk)=>`<button class="toggle" data-skip="${key}" aria-pressed="${sk}">${sk?'Eating out · tap to undo':'Eating out?'}</button>${sk?'<span class="out-label">Taken off the shopping list and prep.</span>':''}`;
+const CARRY_MSG='Freeze this one today. The next prep cooks one less.';
+const toggle=(key,sk,msg=CARRY_MSG)=>`<button class="toggle" data-skip="${key}" aria-pressed="${sk}">${sk?'Eating out · tap to undo':'Eating out?'}</button>${sk?`<span class="out-label">${msg}</span>`:''}`;
 function dinnerCard(m){
   const d=m.dinner,sk=d.key?isSkip(d.key):false;
   const head=(k,p)=>`<div class="meal-h"><span class="meal-t">Dinner</span><span class="kc">${k?`~${k} kcal${p?` · ${p} g protein`:''}`:''}</span></div>`;
   if(d.kind==='none')return `<div class="meal fixed">${head()}<div class="sub">Plan starts Wed 25 Nov.</div></div>`;
-  if(d.kind==='pasta')return `<div class="meal${sk?' skipped':''}">${head(800)}<div class="meal-name">Pasta night</div><div class="add">Your own. 125–150 g dry pasta keeps it at ~800 kcal.</div>${toggle(d.key,sk)}</div>`;
+  if(d.kind==='pasta')return `<div class="meal${sk?' skipped':''}">${head(800)}<div class="meal-name">Pasta night</div><div class="add">Your own. 125–150 g dry pasta keeps it at ~800 kcal.</div>${toggle(d.key,sk,'Nothing to carry over.')}</div>`;
   if(d.kind==='quick'){const q=d.q;return `<div class="meal${sk?' skipped':''}">${head(q.kcal,q.p)}<div class="meal-name">${q.name}</div>
     <ul class="comp">${q.comp.map(r=>`<li><span class="q">${r[0]}</span><span>${r[1]}</span></li>`).join('')}</ul>
-    <details><summary>How to cook it (10 min)</summary><ol>${q.steps.map(x=>`<li>${x}</li>`).join('')}</ol></details>${toggle(d.key,sk)}</div>`}
+    <details><summary>How to cook it (10 min)</summary><ol>${q.steps.map(x=>`<li>${x}</li>`).join('')}</ol></details>${toggle(d.key,sk,'Ingredients keep, cook it another night.')}</div>`}
+  if(d.kind==='leftover')return `<div class="meal${sk?' skipped':''}">${head(d.pot.kcal,d.pot.p)}<div class="meal-name">${d.pot.name} · leftover</div>
+    <ul class="comp"><li><span class="q">1</span><span>portion saved from ${fmt(d.from)}, from the freezer</span></li>
+    ${d.pot.riceG?`<li><span class="q">${d.pot.riceG} g</span><span>rice (dry weight), frozen with it or cook fresh</span></li>`:''}</ul>
+    <div class="add">Thaw in the fridge overnight, microwave until steaming hot.</div>${toggle(d.key,sk)}</div>`;
   if(d.kind==='freezer'){if(!d.pot)return `<div class="meal">${head()}<div class="meal-name">Egg fried rice</div><div class="add">Freezer is empty, so cook it fresh.</div></div>`;
     return `<div class="meal${sk?' skipped':''}">${head(d.pot.kcal,d.pot.p)}<div class="meal-name">${d.pot.name}</div>
     <ul class="comp"><li><span class="q">1</span><span>portion from the freezer, thawed in the fridge overnight</span></li></ul>
@@ -404,14 +438,16 @@ function renderToday(){
   if(m.lunch.kind==='bowl'&&!isSkip(m.lunch.bowl.key)){const n=bowlNums(m.lunch.bowl);lunchK=n.kcal;lunchP=n.p}
   else if(m.lunch.kind==='free'||m.lunch.kind==='bowl'){lunchK=800}
   const dd=m.dinner;
-  if(dd.kind==='pot'||dd.kind==='freezer'){dinK=dd.pot?dd.pot.kcal:800;dinP=dd.pot?dd.pot.p:0}
+  if(dd.kind==='pot'||dd.kind==='freezer'||dd.kind==='leftover'){dinK=dd.pot?dd.pot.kcal:800;dinP=dd.pot?dd.pot.p:0}
   else if(dd.kind==='quick'){dinK=dd.q.kcal;dinP=dd.q.p}else if(dd.kind==='pasta')dinK=800;
   const tk=800+750+lunchK+dinK,tp=60+50+lunchP+dinP;
   const s=session(d);
   const notes=[];
   const tm=mealsFor(add(d,1));
   if(tm.dinner.kind==='freezer'&&tm.dinner.pot&&!isSkip(tm.dinner.key))notes.push(`Tonight: move the frozen <b>${tm.dinner.pot.name.toLowerCase()}</b> portion to the fridge for tomorrow.`);
-  if(tm.lunch.kind==='bowl'&&tm.lunch.bowl.p==='prawns'&&!isSkip(tm.lunch.bowl.key))notes.push('Tonight: move <b>150 g prawns</b> to the fridge for tomorrow\'s lunch.');
+  if(tm.dinner.kind==='leftover'&&!isSkip(tm.dinner.key))notes.push(`Tonight: move the leftover <b>${tm.dinner.pot.name.toLowerCase()}</b> portion from the freezer to the fridge.`);
+  if(tm.lunch.kind==='bowl'&&tm.lunch.bowl.leftover&&!isSkip(tm.lunch.bowl.key))notes.push(`Tonight: move the leftover <b>${tm.lunch.bowl.style.toLowerCase()}</b> box from the freezer to the fridge.`);
+  if(tm.lunch.kind==='bowl'&&!tm.lunch.bowl.leftover&&tm.lunch.bowl.p==='prawns'&&!isSkip(tm.lunch.bowl.key))notes.push('Tonight: move <b>150 g prawns</b> to the fridge for tomorrow\'s lunch.');
   const qk=tm.dinner.kind==='quick'&&!isSkip(tm.dinner.key);
   if(qk)notes.push('Tonight: move <b>100 g prawns</b> to the fridge for tomorrow\'s fried rice.');
   const days=[...Array(7)].map((_,i)=>add(wkStart,i));
@@ -447,7 +483,7 @@ function renderShop(){
   <div class="wrap">
     <div class="head"><div><div class="eyebrow">${iso(sd)===iso(TODAY)?'Today':fmt(sd,{weekday:'long'})} · for ${s.type==='sun'?'Sunday':'Wednesday'} prep</div><h1>${fmt(sd,{day:'numeric',month:'long'})}</h1></div>
       <div class="navbtns"><button class="icon-btn" data-shop="-1" aria-label="Previous list" ${prevSession(shopS)>=START?'':'disabled'}>‹</button><button class="icon-btn" data-shop="1" aria-label="Next list">›</button></div></div>
-    <div class="sub">${s.type==='sun'?'Bowls Mon–Wed':'Bowls Thu–Sat'}, ${sh.c.portions?`${sh.c.pot.name.toLowerCase()} (${sh.c.portions} portions)`:'no dinner pot (both nights out)'}${s.type==='sun'?', plus the week\'s breakfast and shake':''}. Meals marked as eating out are already left off.</div>
+    <div class="sub">${sh.c.eaten.length} ${sh.c.eaten.length===1?'bowl':'bowls'}${s.type==='sun'?' (Mon–Wed)':' (Thu–Sat)'}, ${sh.c.portions?`${sh.c.pot.name.toLowerCase()} (${sh.c.portions} portions)`:'no dinner pot'}${s.type==='sun'?', plus the week\'s breakfast and shake':''}.${sh.c.inL.length+sh.c.inD.length?` Leftovers in the freezer cover ${sh.c.inL.length+sh.c.inD.length} ${sh.c.inL.length+sh.c.inD.length===1?'meal':'meals'}, so this list is smaller.`:' Normal quantities. Eating out later just leaves a portion for the next prep.'}</div>
     <div class="total"><span class="sub">${done} of ${total} in the basket</span><button class="ghost" data-reset="${id}">Untick all</button></div>
     <div class="progress" aria-hidden="true"><span style="width:${total?done/total*100:0}%"></span></div>
     ${rows}
@@ -480,12 +516,16 @@ function renderPrep(){
   if(nx.lunch.kind==='bowl'&&nx.lunch.bowl.p==='prawns'&&!isSkip(nx.lunch.bowl.key))notes.push('Move 150 g prawns to the fridge for tomorrow\'s lunch.');
   if(c.extras.length)notes.push('Move 100 g prawns to the fridge for tomorrow\'s fried rice.');
   const f=c.portions/3;
-  const potWhere=c.portions?[...s.potNights.filter(d=>!isSkip(iso(d)+'|dinner')).map(d=>fmt(d,{weekday:'long'})),'freezer'].join(', '):'';
+  const potWhere=c.potSlots.map(d=>d.frozen?'freezer':isSkip(d.key)?`freezer (out ${fmt(d.date,{weekday:'long'})})`:fmt(d.date,{weekday:'long'})).join(', ');
+  const carry=[...c.inL.map(x=>`<li><b>${x.bowl.style}</b> box (from ${fmt(x.from)})</li>`),...c.inD.map(x=>`<li><b>${POT[x.potKey].name}</b> portion (from ${fmt(x.from)})</li>`)];
+  const outNow=[...SIM.res[iso(s.date)].lunch.filter(b=>isSkip(b.key)),...SIM.res[iso(s.date)].dinner.filter(d=>isSkip(d.key))].length;
   document.getElementById('v-prep').innerHTML=`
   <div class="wrap">
     <div class="head"><div><div class="eyebrow">${iso(s.date)===iso(TODAY)?'Today':fmt(s.date,{weekday:'long'})} · week ${s.week} of 3 · ~75 min</div><h1>Prep ${fmt(s.date,{day:'numeric',month:'long'})}</h1></div>
       <div class="navbtns"><button class="icon-btn" data-prep="-1" aria-label="Previous prep" ${prevSession(prepS)>=START?'':'disabled'}>‹</button><button class="icon-btn" data-prep="1" aria-label="Next prep">›</button></div></div>
-    ${c.eaten.length||c.portions?'':'<div class="empty">Everything this session covers is marked as eating out. Nothing to prep.</div>'}
+    ${carry.length?`<div class="note"><b>Already in the freezer, so cooking less</b><ul>${carry.join('')}</ul></div>`:''}
+    ${outNow?`<div class="note"><span>${outNow} ${outNow===1?'meal':'meals'} from this prep marked as eating out. Cook as normal and freeze ${outNow===1?'that portion':'those portions'}. The next prep cooks less.</span></div>`:''}
+    ${c.eaten.length||c.portions?'':'<div class="empty">Leftovers cover everything this prep would make. Nothing to cook.</div>'}
     ${Object.keys(rice).length?`<div class="card step"><h3>1. Start the rice</h3><ul>${Object.entries(rice).map(([k,v])=>`<li><b>${v} g</b> ${k.toLowerCase()} (dry)</li>`).join('')}</ul><div class="sub">Spread it out to cool after cooking and get it into the fridge within an hour.</div></div>`:''}
     ${c.tray.length||pot_?`<div class="card step"><h3>2. Oven to 220°C, veg trays</h3><ul>
       ${c.tray.length?`<li>${c.tray.map(([n,g])=>`<b>${g} g</b> ${n.toLowerCase()}`).join(', ')}, in 2–3 cm pieces with 2–3 tbsp oil and salt. 25–30 min, turn once.</li>`:''}
@@ -505,6 +545,7 @@ function renderPrep(){
 
 /* ---------- wiring ---------- */
 function render(){
+  buildSim(add([selDay,shopS,prepS].reduce((a,b)=>a>b?a:b),14));
   ['today','shop','prep'].forEach(v=>{document.getElementById('v-'+v).hidden=v!==view;document.getElementById('t-'+v).setAttribute('aria-selected',v===view)});
   if(view==='today')renderToday();else if(view==='shop')renderShop();else renderPrep();
 }
